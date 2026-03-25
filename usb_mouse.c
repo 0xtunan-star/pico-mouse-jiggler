@@ -355,26 +355,19 @@ static void bootsel_task(void) {
 }
 
 static void hid_task(void) {
-    const uint32_t interval_ms = 10;
+    const uint32_t interval_ms = 20;
     static uint32_t start_ms = 0;
 
     if (board_millis() - start_ms < interval_ms) return;
     start_ms += interval_ms;
 
     if (!tud_hid_ready()) return;
-    if (!random_movement_enabled) return;
 
-    // 👉 优先晃动
-    if (process_mouse_shake()) {
-        tud_hid_mouse_report(REPORT_ID_MOUSE, 0, mouse_x, mouse_y, 0, 0);
-        mouse_x = 0;
-        mouse_y = 0;
-        return;
-    }
-
-    // 👉 拟真移动
-    generate_movement();
+    // ⭐ 强制移动（测试用）
+    tud_hid_mouse_report(REPORT_ID_MOUSE, 0, 5, 0, 0, 0);
 }
+
+
 
 int main(void) {
     // 初始化板级外设（GPIO、电源等）
