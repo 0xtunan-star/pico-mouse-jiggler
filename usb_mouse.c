@@ -83,6 +83,7 @@ static int rand_range(int min, int max) {
     return min + rand() % (max - min + 1);
 }
 
+static void hid_task(void);
 static inline void put_pixel(uint32_t pixel_grb) {
     pio_sm_put_blocking(ws2812_pio, ws2812_sm, pixel_grb << 8u);
 }
