@@ -354,17 +354,54 @@ static void bootsel_task(void) {
     ws2812_status_task();
 }
 
-static void hid_task(void) {
-    const uint32_t interval_ms = 20;
-    static uint32_t start_ms = 0;
+// ================== 拟真轨迹状态 ==================
+static int step = 0;
+static int total_steps = 0;
+static float total_x = 0;
+static float total_y = 0;
+static float cur_x = 0;
+static float cur_y = 0;
 
-    if (board_millis() - start_ms < interval_ms) return;
-    start_ms += interval_ms;
+// 生成一段新轨迹
+void start_new_movement() {
+    total_x = rand_range(-120, 120);
+    total_y = rand_range(-120, 120);
 
-    if (!tud_hid_ready()) return;
+    total_steps = rand_range(20, 40);
 
-    // ⭐ 强制移动（测试用）
-    tud_hid_mouse_report(REPORT_ID_MOUSE, 0, 5, 0, 0, 0);
+    cur_x = 0;
+    cur_y = 0;
+    step = 0;
+}
+
+// 每次调用走一步（非阻塞！）
+bool process_movement_step(int8_t *dx, int8_t *dy) {
+    if (step >= total_steps) return false;
+
+    float t = (float)step / total_steps;
+
+    // ⭐ 加速减速曲线
+    float ease;
+    if (t < 0.5) ease = 2 * t * t;
+    else ease = -1 + (4 - 2 * t) * t;
+
+    float target_x = total_x * ease;
+    float target_y = total_y * ease;
+
+    *dx = (int)(target_x - cur_x);
+    *dy = (int)(target_y - cur_y);
+
+    cur_x = target_x;
+    cur_y = target_y;
+
+    // ⭐ 抖动
+    *dx += rand_range(-2, 2);
+    *dy += rand_range(-2, 2);
+
+    if (*dx == 0 && *dy == 0) *dx = 1;
+
+    step++;
+    return true;
 }
 
 
