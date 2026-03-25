@@ -20,9 +20,8 @@ jobs:
 
       - name: Build
         run: |
-          export PICO_SDK_PATH=$HOME/pico-sdk
           mkdir build && cd build
-          cmake .. -G Ninja
+          cmake .. -G Ninja -DPICO_SDK_PATH=$HOME/pico-sdk
           ninja
 
       - name: Upload UF2
