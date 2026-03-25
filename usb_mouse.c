@@ -71,62 +71,67 @@ static void do_human_move(void) {
 
     LED_MOVING;
 
-    move_type_t type = pick_move_type();
+    // 🎯 总移动距离（明显可见）
+    int total_x = rand_range(-120, 120);
+    int total_y = rand_range(-120, 120);
 
-    int total_x, total_y, steps;
+    // 🎯 步数（影响平滑度）
+    int steps = rand_range(20, 40);
 
-        switch (type) {
-        case MOVE_MICRO:
-            total_x = rand_range(-15, 15);
-            total_y = rand_range(-15, 15);
-            steps   = rand_range(5, 10);
-            break;
-    
-        case MOVE_SHORT:
-            total_x = rand_range(-60, 60);
-            total_y = rand_range(-60, 60);
-            steps   = rand_range(8, 15);
-            break;
-    
-        default:
-            total_x = rand_range(-120, 120);
-            total_y = rand_range(-120, 120);
-            steps   = rand_range(10, 20);
-            break;
-    }
+    float cur_x = 0;
+    float cur_y = 0;
 
-    float prev_x = 0;
-    float prev_y = 0;
-
-    for (int i = 1; i <= steps; i++) {
+    for (int i = 0; i < steps; i++) {
         float t = (float)i / steps;
-        float ease = t * t * (3 - 2 * t);
+
+        // 🧠 加速度曲线（ease in-out）
+        float ease;
+        if (t < 0.5) {
+            ease = 2 * t * t;
+        } else {
+            ease = -1 + (4 - 2 * t) * t;
+        }
 
         float target_x = total_x * ease;
         float target_y = total_y * ease;
 
-        int dx = (int)(target_x - prev_x) + rand_range(-1, 1);
-        int dy = (int)(target_y - prev_y) + rand_range(-1, 1);
+        int move_x = (int)(target_x - cur_x);
+        int move_y = (int)(target_y - cur_y);
 
-        prev_x = target_x;
-        prev_y = target_y;
+        cur_x = target_x;
+        cur_y = target_y;
+
+        // 🎯 抖手（模拟人手不稳）
+        move_x += rand_range(-2, 2);
+        move_y += rand_range(-2, 2);
+
+        // 🚫 避免 0 移动（否则系统忽略）
+        if (move_x == 0 && move_y == 0) continue;
+
+        uint8_t report[4] = {0, (int8_t)move_x, (int8_t)move_y, 0};
+        tud_hid_report(0, report, sizeof(report));
+
+        // 🎯 随机停顿（人类行为）
+        if (rand() % 10 == 0) {
+            sleep_ms(rand_range(80, 200));  // 停顿
+        } else {
+            sleep_ms(rand_range(10, 25));
+        }
+    }
+
+    // 🎯 偶尔微调（小抖一下）
+    for (int i = 0; i < rand_range(2, 5); i++) {
+        int dx = rand_range(-5, 5);
+        int dy = rand_range(-5, 5);
 
         uint8_t report[4] = {0, (int8_t)dx, (int8_t)dy, 0};
         tud_hid_report(0, report, sizeof(report));
 
-        uint8_t zero[4] = {0};
-        tud_hid_report(0, zero, sizeof(zero));
-
-        sleep_ms(rand_range(10, 24));
+        sleep_ms(rand_range(20, 60));
     }
 
-    if (rand() % 25 == 0) {
-        uint8_t click[4] = {1,0,0,0};
-        tud_hid_report(0, click, sizeof(click));
-        sleep_ms(20);
-        uint8_t release[4] = {0};
-        tud_hid_report(0, release, sizeof(release));
-    }
+    // 👉 保持紫色一会，让你能看到
+    sleep_ms(300);
 
     LED_ACTIVE;
 }
