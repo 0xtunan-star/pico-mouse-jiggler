@@ -73,6 +73,8 @@ typedef enum {
     WS_LOG_ERROR
 } ws_log_state_t;
 
+static void ws2812_log_state(ws_log_state_t state);
+static void ws2812_restore_status_color(void);
 static bool usb_host_mounted = false;
 static bool usb_suspended = false;
 static bool random_movement_enabled = false;
