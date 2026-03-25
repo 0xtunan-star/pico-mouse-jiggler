@@ -26,7 +26,7 @@ jobs:
           ninja
 
       - name: Upload UF2
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: usb_mouse
           path: build/usb_mouse.uf2
