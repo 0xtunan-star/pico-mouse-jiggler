@@ -75,21 +75,23 @@ static void do_human_move(void) {
 
     int total_x, total_y, steps;
 
-    switch (type) {
+        switch (type) {
         case MOVE_MICRO:
-            total_x = rand_range(-5, 5);
-            total_y = rand_range(-5, 5);
+            total_x = rand_range(-15, 15);
+            total_y = rand_range(-15, 15);
             steps   = rand_range(5, 10);
             break;
+    
         case MOVE_SHORT:
-            total_x = rand_range(-30, 30);
-            total_y = rand_range(-30, 30);
-            steps   = rand_range(10, 20);
+            total_x = rand_range(-60, 60);
+            total_y = rand_range(-60, 60);
+            steps   = rand_range(8, 15);
             break;
+    
         default:
-            total_x = rand_range(-80, 80);
-            total_y = rand_range(-80, 80);
-            steps   = rand_range(20, 35);
+            total_x = rand_range(-120, 120);
+            total_y = rand_range(-120, 120);
+            steps   = rand_range(10, 20);
             break;
     }
 
@@ -115,7 +117,7 @@ static void do_human_move(void) {
         uint8_t zero[4] = {0};
         tud_hid_report(0, zero, sizeof(zero));
 
-        sleep_ms(rand_range(5, 15));
+        sleep_ms(rand_range(10, 24));
     }
 
     if (rand() % 25 == 0) {
