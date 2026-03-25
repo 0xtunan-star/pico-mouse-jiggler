@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#define MOUSE_BUTTON_LEFT 0x01
 #include <stdio.h>
 #include <stdlib.h>
 
