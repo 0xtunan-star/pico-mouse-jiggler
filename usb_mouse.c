@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
@@ -14,6 +15,7 @@
 #include "bsp/board_api.h"
 #include "tusb.h"
 #include "ws2812.pio.h"
+
 
 // WS2812 LED 接到 GP16
 #define WS2812_PIN 16
@@ -86,95 +88,143 @@ static int rand_range(int min, int max) {
 static void hid_task(void)
 {
     if (!tud_hid_ready()) return;
+    if (!random_movement_enabled) return;
 
     uint32_t now = board_millis();
 
-    // ================= 状态 =================
-    static bool moving = false;
-    static uint32_t last_action_time = 0;
-    static uint32_t next_interval = 3000;
+    // ===== 动态节奏控制（关键）=====
+    static uint32_t next_tick = 0;
+    if (now < next_tick) return;
 
+    typedef enum {
+        STATE_IDLE,
+        STATE_MOVING,
+        STATE_PAUSE,
+        STATE_CLICK
+    } state_t;
+
+    static state_t state = STATE_IDLE;
+
+    // ===== 轨迹参数 =====
     static int step = 0;
     static int total_steps = 0;
+    static float total_x = 0, total_y = 0;
+    static float cur_x = 0, cur_y = 0;
 
-    static float total_x = 0;
-    static float total_y = 0;
+    static uint32_t state_until = 0;
 
-    static float cur_x = 0;
-    static float cur_y = 0;
+    int8_t dx = 0, dy = 0;
 
-    // ================= 开始新移动 =================
-    if (!moving) {
-        if (now - last_action_time < next_interval) return;
+    switch (state)
+    {
+        case STATE_IDLE:
+            if (now > state_until)
+            {
+                total_x = rand_range(-200, 200);
+                total_y = rand_range(-200, 200);
 
-        // 新轨迹
-        total_x = rand_range(-200, 200);
-        total_y = rand_range(-150, 150);
+                // ⭐ 偶尔大甩
+                if (rand() % 5 == 0) {
+                    total_x *= 2;
+                    total_y *= 2;
+                }
 
-        total_steps = rand_range(25, 60);
+                float dist = sqrtf(total_x * total_x + total_y * total_y);
 
-        cur_x = 0;
-        cur_y = 0;
-        step = 0;
+                // ⭐ 距离决定速度
+                if (dist > 150)
+                    total_steps = rand_range(20, 40);   // 快
+                else
+                    total_steps = rand_range(40, 100);  // 慢
 
-        moving = true;
-        return;
-    }
+                cur_x = 0;
+                cur_y = 0;
+                step = 0;
 
-    // ================= 执行轨迹 =================
-    if (step < total_steps) {
-        float t = (float)step / total_steps;
+                state = STATE_MOVING;
+                ws2812_log_state(WS_LOG_ACTIVITY);
+            }
+            break;
 
-        // ⭐ 加速减速（核心）
-        float ease;
-        if (t < 0.5)
-            ease = 2 * t * t;
-        else
-            ease = -1 + (4 - 2 * t) * t;
+        case STATE_MOVING:
+        {
+            float t = (float)step / total_steps;
 
-        float target_x = total_x * ease;
-        float target_y = total_y * ease;
+            // ⭐ 更拟人的加速曲线
+            float ease;
+            if (t < 0.3)
+                ease = 3 * t * t;
+            else if (t < 0.7)
+                ease = 0.5 + (t - 0.3);
+            else
+                ease = 1 - (1 - t)*(1 - t);
 
-        int dx = (int)(target_x - cur_x);
-        int dy = (int)(target_y - cur_y);
+            float target_x = total_x * ease;
+            float target_y = total_y * ease;
 
-        cur_x = target_x;
-        cur_y = target_y;
+            dx = (int)(target_x - cur_x);
+            dy = (int)(target_y - cur_y);
 
-        // ⭐ 抖手
-        dx += rand_range(-2, 2);
-        dy += rand_range(-2, 2);
+            cur_x = target_x;
+            cur_y = target_y;
 
-        if (dx != 0 || dy != 0) {
-            tud_hid_mouse_report(REPORT_ID_MOUSE, 0, dx, dy, 0, 0);
+            // ⭐ 微抖动
+            dx += rand_range(-1, 1);
+            dy += rand_range(-1, 1);
+
+            if (dx != 0 || dy != 0)
+            {
+                tud_hid_mouse_report(REPORT_ID_MOUSE, 0, dx, dy, 0, 0);
+            }
+
+            step++;
+
+            if (step >= total_steps)
+            {
+                // ⭐ 20%概率点击
+                if (rand() % 5 == 0)
+                {
+                    state = STATE_CLICK;
+                }
+                else
+                {
+                    state = STATE_PAUSE;
+                    state_until = now + rand_range(500, 3000);
+                }
+            }
+
+            // ⭐ 动态速度（核心）
+            if (t < 0.2)
+                next_tick = now + rand_range(2, 6);
+            else if (t < 0.8)
+                next_tick = now + rand_range(1, 4);
+            else
+                next_tick = now + rand_range(5, 15);
         }
+        break;
 
-        step++;
-        return;
+        case STATE_CLICK:
+            tud_hid_mouse_report(REPORT_ID_MOUSE, 0x01, 0, 0, 0, 0);
+            sleep_ms(rand_range(50, 120));
+
+            tud_hid_mouse_report(REPORT_ID_MOUSE, 0x00, 0, 0, 0, 0);
+
+            state = STATE_PAUSE;
+            state_until = now + rand_range(800, 4000);
+            next_tick = now + 50;
+            break;
+
+        case STATE_PAUSE:
+            if (now > state_until)
+            {
+                state = STATE_IDLE;
+                state_until = now + rand_range(2000, 8000);
+                ws2812_restore_status_color();
+            }
+            next_tick = now + rand_range(10, 30);
+            break;
     }
-
-    // ================= 收尾（微抖 + 点击） =================
-    for (int i = 0; i < rand_range(2, 5); i++) {
-        int dx = rand_range(-3, 3);
-        int dy = rand_range(-3, 3);
-        tud_hid_mouse_report(REPORT_ID_MOUSE, 0, dx, dy, 0, 0);
-    }
-
-    // ⭐ 20% 概率点击
-    if (rand() % 5 == 0) {
-        tud_hid_mouse_report(REPORT_ID_MOUSE, MOUSE_BUTTON_LEFT, 0, 0, 0, 0);
-        sleep_ms(50);
-        tud_hid_mouse_report(REPORT_ID_MOUSE, 0, 0, 0, 0, 0);
-    }
-
-    // ================= 重置 =================
-    moving = false;
-    last_action_time = now;
-
-    // 下次间隔（更像人）
-    next_interval = rand_range(2000, 8000);
 }
-
 static inline void put_pixel(uint32_t pixel_grb) {
     pio_sm_put_blocking(ws2812_pio, ws2812_sm, pixel_grb << 8u);
 }
