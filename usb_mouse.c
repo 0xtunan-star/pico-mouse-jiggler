@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+#define MOUSE_BUTTON_LEFT 0x01
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -85,21 +86,94 @@ static int rand_range(int min, int max) {
 
 static void hid_task(void)
 {
-    static uint32_t last_ms = 0;
-    uint32_t now = board_millis();
-
-    // USB 没 ready 不发
     if (!tud_hid_ready()) return;
 
-    // 每 50ms 动一次
-    if (now - last_ms < 50) return;
-    last_ms = now;
+    uint32_t now = board_millis();
 
-    // 👉 强制左右抖动
-    static int dir = 1;
-    dir = -dir;
+    // ================= 状态 =================
+    static bool moving = false;
+    static uint32_t last_action_time = 0;
+    static uint32_t next_interval = 3000;
 
-    tud_hid_mouse_report(REPORT_ID_MOUSE, 0, dir * 5, 0, 0, 0);
+    static int step = 0;
+    static int total_steps = 0;
+
+    static float total_x = 0;
+    static float total_y = 0;
+
+    static float cur_x = 0;
+    static float cur_y = 0;
+
+    // ================= 开始新移动 =================
+    if (!moving) {
+        if (now - last_action_time < next_interval) return;
+
+        // 新轨迹
+        total_x = rand_range(-200, 200);
+        total_y = rand_range(-150, 150);
+
+        total_steps = rand_range(25, 60);
+
+        cur_x = 0;
+        cur_y = 0;
+        step = 0;
+
+        moving = true;
+        return;
+    }
+
+    // ================= 执行轨迹 =================
+    if (step < total_steps) {
+        float t = (float)step / total_steps;
+
+        // ⭐ 加速减速（核心）
+        float ease;
+        if (t < 0.5)
+            ease = 2 * t * t;
+        else
+            ease = -1 + (4 - 2 * t) * t;
+
+        float target_x = total_x * ease;
+        float target_y = total_y * ease;
+
+        int dx = (int)(target_x - cur_x);
+        int dy = (int)(target_y - cur_y);
+
+        cur_x = target_x;
+        cur_y = target_y;
+
+        // ⭐ 抖手
+        dx += rand_range(-2, 2);
+        dy += rand_range(-2, 2);
+
+        if (dx != 0 || dy != 0) {
+            tud_hid_mouse_report(REPORT_ID_MOUSE, 0, dx, dy, 0, 0);
+        }
+
+        step++;
+        return;
+    }
+
+    // ================= 收尾（微抖 + 点击） =================
+    for (int i = 0; i < rand_range(2, 5); i++) {
+        int dx = rand_range(-3, 3);
+        int dy = rand_range(-3, 3);
+        tud_hid_mouse_report(REPORT_ID_MOUSE, 0, dx, dy, 0, 0);
+    }
+
+    // ⭐ 20% 概率点击
+    if (rand() % 5 == 0) {
+        tud_hid_mouse_report(REPORT_ID_MOUSE, MOUSE_BUTTON_LEFT, 0, 0, 0, 0);
+        sleep_ms(50);
+        tud_hid_mouse_report(REPORT_ID_MOUSE, 0, 0, 0, 0, 0);
+    }
+
+    // ================= 重置 =================
+    moving = false;
+    last_action_time = now;
+
+    // 下次间隔（更像人）
+    next_interval = rand_range(2000, 8000);
 }
 
 static inline void put_pixel(uint32_t pixel_grb) {
