@@ -1,0 +1,32 @@
+name: Build
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build gcc-arm-none-eabi libnewlib-arm-none-eabi
+
+      - name: Clone Pico SDK
+        run: |
+          git clone https://github.com/raspberrypi/pico-sdk.git $HOME/pico-sdk
+          cd $HOME/pico-sdk && git submodule update --init lib/tinyusb
+
+      - name: Build
+        run: |
+          export PICO_SDK_PATH=$HOME/pico-sdk
+          mkdir build && cd build
+          cmake .. -G Ninja
+          ninja
+
+      - name: Upload UF2
+        uses: actions/upload-artifact@v3
+        with:
+          name: usb_mouse
+          path: build/usb_mouse.uf2
