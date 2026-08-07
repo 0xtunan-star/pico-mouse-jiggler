@@ -1,8 +1,7 @@
 /**
- * Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * 最终硬核修复版：强制禁用 + 电平直接判断（无视抖动）
+ * 稳定直启版：上电自动启用，无按键切换，去掉所有干扰逻辑
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,13 +25,11 @@
 #define REPORT_ID_MOUSE    1
 #define REPORT_ID_KEYBOARD 2
 
-#define COLOR_RED          0xff0000
 #define COLOR_GREEN        0x00ff00
 #define COLOR_BLUE         0x0000ff
 #define COLOR_AMBER        0xff8000
-#define COLOR_YELLOW       0xffff00
 #define COLOR_PURPLE       0xff00ff
-#define COLOR_OFF          0x000000
+#define COLOR_RED          0xff0000
 
 // ========================================================================
 // 全局变量
@@ -42,21 +39,11 @@ uint ws2812_sm;
 uint ws2812_offset;
 
 static bool usb_host_mounted = false;
-static bool usb_suspended    = false;
-static bool random_movement_enabled = false;
+static bool random_movement_enabled = true;  // 直接启用
 
 static bool ws_activity_flash = false;
 static uint32_t ws_activity_timestamp = 0;
 static uint32_t ws_activity_duration_ms = 0;
-
-// 按键状态（直接记录当前物理电平，不再依赖边沿检测）
-static bool button_physical_state = false;
-static uint32_t button_last_toggle_ms = 0;
-
-// 工作/休息周期
-typedef enum { MACRO_STATE_WORK, MACRO_STATE_REST } macro_state_t;
-static macro_state_t macro_state = MACRO_STATE_WORK;
-static uint32_t macro_until_ms = 0;
 
 // 鼠标状态机
 typedef enum {
@@ -137,30 +124,20 @@ static void ws2812_log_state(ws_log_state_t state) {
     switch (state) {
         case WS_LOG_BOOTING:   set_led_color(COLOR_AMBER); break;
         case WS_LOG_USB_READY: set_led_color(COLOR_BLUE);  break;
-        case WS_LOG_HOST_READY:set_led_color(COLOR_GREEN); break;
+        case WS_LOG_HOST_READY:set_led_color(dim_color(COLOR_GREEN, 1)); break;
         case WS_LOG_ACTIVITY:  set_led_color(COLOR_PURPLE);break;
-        case WS_LOG_SUSPENDED: set_led_color(COLOR_YELLOW);break;
+        case WS_LOG_SUSPENDED: set_led_color(COLOR_AMBER); break;
         case WS_LOG_ERROR:
         default:               set_led_color(COLOR_RED);   break;
     }
 }
 
 static void ws2812_restore_status_color(void) {
-    if (usb_suspended) {
-        ws2812_log_state(WS_LOG_SUSPENDED);
-        return;
-    }
     if (!usb_host_mounted) {
         ws2812_log_state(WS_LOG_USB_READY);
         return;
     }
-    if (random_movement_enabled && macro_state == MACRO_STATE_WORK) {
-        set_led_color(dim_color(COLOR_GREEN, 1));
-    } else if (random_movement_enabled && macro_state == MACRO_STATE_REST) {
-        set_led_color(dim_color(COLOR_AMBER, 1));
-    } else {
-        set_led_color(dim_color(COLOR_RED, 1));
-    }
+    ws2812_log_state(WS_LOG_HOST_READY);
 }
 
 static void ws2812_flash_state(ws_log_state_t state, uint32_t duration_ms) {
@@ -205,12 +182,11 @@ static void send_keyboard_report(uint8_t modifier, uint8_t k1, uint8_t k2,
 }
 
 // ========================================================================
-// 鼠标任务
+// 鼠标任务（完整优化）
 // ========================================================================
 static void hid_task(void) {
     if (!tud_hid_ready()) return;
     if (!random_movement_enabled) return;
-    if (macro_state == MACRO_STATE_REST) return;
 
     uint32_t now = board_millis();
     if (now < mouse_next_tick) return;
@@ -309,7 +285,7 @@ static void hid_task(void) {
 }
 
 // ========================================================================
-// 键盘状态机（非阻塞）
+// 键盘任务（保留非阻塞状态机）
 // ========================================================================
 static void kb_ctx_reset(void) {
     kb_ctx.state = KB_STATE_IDLE;
@@ -416,7 +392,6 @@ static void keyboard_state_machine(void) {
 }
 static void keyboard_task(void) {
     if (!random_movement_enabled) { next_keyboard_interval_ms = 0; return; }
-    if (macro_state == MACRO_STATE_REST) return;
     if (kb_ctx.action_running) { keyboard_state_machine(); return; }
     uint32_t now = board_millis();
     if (next_keyboard_interval_ms == 0) {
@@ -430,93 +405,6 @@ static void keyboard_task(void) {
         kb_ctx.state = KB_STATE_WAIT_START;
         kb_ctx.state_until_ms = now + 1;
     }
-}
-
-// ========================================================================
-// 工作/休息周期
-// ========================================================================
-static void macro_cycle_task(void) {
-    if (!random_movement_enabled) { macro_state = MACRO_STATE_WORK; return; }
-    uint32_t now = board_millis();
-    if (macro_until_ms == 0) {
-        macro_state = MACRO_STATE_WORK;
-        macro_until_ms = now + rand_range(300000, 900000);
-        return;
-    }
-    if (now >= macro_until_ms) {
-        if (macro_state == MACRO_STATE_WORK) {
-            macro_state = MACRO_STATE_REST;
-            macro_until_ms = now + rand_range(120000, 300000);
-            ws2812_restore_status_color();
-            mouse_state = MOUSE_STATE_IDLE;
-            mouse_state_until = now + rand_range(2000, 8000);
-            printf("Entering REST period\n");
-        } else {
-            macro_state = MACRO_STATE_WORK;
-            macro_until_ms = now + rand_range(300000, 900000);
-            ws2812_restore_status_color();
-            printf("Entering WORK period\n");
-        }
-    }
-}
-
-// ========================================================================
-// BOOTSEL 按键处理（暴力电平读取，无视抖动）
-// ========================================================================
-static void bootsel_task(void) {
-    static uint32_t last_poll_ms = 0;
-    static bool init_done = false;
-    uint32_t now = board_millis();
-
-    // 上电前 500ms 完全忽略按键，并且强制保持禁用态
-    if (now < 500) {
-        // 强制红灯（避免任何误操作）
-        if (random_movement_enabled) {
-            random_movement_enabled = false;
-        }
-        ws2812_status_task();
-        return;
-    }
-
-    // 初始化：只执行一次，强制禁用并记录当前物理电平
-    if (!init_done) {
-        random_movement_enabled = false;
-        button_physical_state = (board_button_read() == 0); // 记录当前电平
-        init_done = true;
-        ws2812_restore_status_color(); // 强制设为红色
-        printf("BOOTSEL init: state=%d\n", button_physical_state);
-        return;
-    }
-
-    if (now - last_poll_ms < 20) { // 稍微拉长轮询间隔
-        ws2812_status_task();
-        return;
-    }
-    last_poll_ms = now;
-
-    // 直接读取当前物理电平
-    bool current_level = (board_button_read() == 0);
-
-    // 检测电平变化（从高到低，即按下）
-    // 注意：这里不依赖 previous 的初始值，只检测真实的电平跳变
-    if (current_level && !button_physical_state) {
-        // 防抖：只有持续稳定的电平变化才触发（由主循环多次读取保证）
-        if (now - button_last_toggle_ms > 300) {
-            random_movement_enabled = !random_movement_enabled;
-            button_last_toggle_ms = now;
-            ws2812_flash_state(WS_LOG_ACTIVITY, 150);
-            printf("Movement %s\n", random_movement_enabled ? "ENABLED" : "DISABLED");
-
-            if (random_movement_enabled) {
-                macro_until_ms = 0;
-                macro_state = MACRO_STATE_WORK;
-            }
-        }
-    }
-
-    // 更新上一次的电平状态（无论是否触发切换）
-    button_physical_state = current_level;
-    ws2812_status_task();
 }
 
 // ========================================================================
@@ -618,24 +506,20 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
 
 void tud_mount_cb(void) {
     usb_host_mounted = true;
-    usb_suspended = false;
     ws2812_restore_status_color();
     printf("USB Mounted\n");
 }
 void tud_umount_cb(void) {
     usb_host_mounted = false;
-    usb_suspended = false;
     ws2812_restore_status_color();
     printf("USB Unmounted\n");
 }
 void tud_suspend_cb(bool remote_wakeup_en) {
     (void)remote_wakeup_en;
-    usb_suspended = true;
-    ws2812_restore_status_color();
+    ws2812_log_state(WS_LOG_SUSPENDED);
     printf("USB Suspended\n");
 }
 void tud_resume_cb(void) {
-    usb_suspended = false;
     ws2812_restore_status_color();
     printf("USB Resumed\n");
 }
@@ -654,22 +538,18 @@ int main(void) {
 
     srand(to_ms_since_boot(get_absolute_time()));
 
-    // 强制初始化为禁用
-    random_movement_enabled = false;
+    random_movement_enabled = true;
     ws2812_restore_status_color();
 
     tusb_init();
     if (board_init_after_tusb) board_init_after_tusb();
 
     next_keyboard_interval_ms = 0;
-    macro_until_ms = 0;
     kb_ctx_reset();
 
     while (true) {
         tud_task();
-        macro_cycle_task();
         hid_task();
         keyboard_task();
-        bootsel_task();
     }
 }
