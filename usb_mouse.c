@@ -463,17 +463,8 @@ const uint8_t* tud_descriptor_device_cb(void) {
 const uint8_t desc_hid_report[] = {
     // 鼠标报告 (ID=1)
     TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(REPORT_ID_MOUSE)),
-
     // 键盘报告 (ID=2)
-    HID_USAGE_PAGE_N( HID_USAGE_PAGE_DESKTOP, 1 ),
-    HID_USAGE_N( HID_USAGE_DESKTOP_KEYBOARD, 1 ),
-    HID_COLLECTION_N( HID_COLLECTION_APPLICATION, 1 ),
-        HID_USAGE_N( HID_USAGE_DESKTOP_KEYBOARD, 1 ),
-        HID_REPORT_ID( REPORT_ID_KEYBOARD ),
-        HID_REPORT_SIZE( 8 ),
-        HID_REPORT_COUNT( 1 ),
-        HID_INPUT( HID_DATA | HID_VARIABLE | HID_ABSOLUTE ),
-    HID_COLLECTION_END,
+    TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(REPORT_ID_KEYBOARD))
 };
 
 const uint8_t* tud_hid_descriptor_report_cb(uint8_t instance) {
