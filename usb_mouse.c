@@ -2,15 +2,8 @@
  * Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * 最终修复版 v3（完整回调）：复合 HID 鼠标 + 键盘
- * - 鼠标：贝塞尔 + 微震颤 + 过冲回调 + 随机点击（已修复释放）
- * - 键盘：8 种动作（非阻塞状态机）
- * - 工作/休息周期：活跃 5~15min，休息 2~5min
- * - LED 状态：琥珀启动，蓝 USB 准备，绿工作，琥珀休息，紫活动，黄挂起，红错误
- * - BOOTSEL 短按切换启用/禁用（修正极性）
- * - 上电默认禁用（红灯）
+ * 最终硬核修复版：强制禁用 + 电平直接判断（无视抖动）
  */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -56,8 +49,9 @@ static bool ws_activity_flash = false;
 static uint32_t ws_activity_timestamp = 0;
 static uint32_t ws_activity_duration_ms = 0;
 
-static bool bootsel_last_level = false;
-static uint32_t bootsel_last_toggle_ms = 0;
+// 按键状态（直接记录当前物理电平，不再依赖边沿检测）
+static bool button_physical_state = false;
+static uint32_t button_last_toggle_ms = 0;
 
 // 工作/休息周期
 typedef enum { MACRO_STATE_WORK, MACRO_STATE_REST } macro_state_t;
@@ -467,44 +461,49 @@ static void macro_cycle_task(void) {
 }
 
 // ========================================================================
-// BOOTSEL 按键处理（上电 1 秒内忽略 + 强制禁用）
+// BOOTSEL 按键处理（暴力电平读取，无视抖动）
 // ========================================================================
 static void bootsel_task(void) {
     static uint32_t last_poll_ms = 0;
-    static bool first_run = true;
+    static bool init_done = false;
     uint32_t now = board_millis();
 
-    // 上电前 1 秒内完全忽略按键，避开抖动
-    if (now < 1000) {
-        // 但 LED 状态仍需刷新（保持当前颜色）
+    // 上电前 500ms 完全忽略按键，并且强制保持禁用态
+    if (now < 500) {
+        // 强制红灯（避免任何误操作）
+        if (random_movement_enabled) {
+            random_movement_enabled = false;
+        }
         ws2812_status_task();
         return;
     }
 
-    if (now - last_poll_ms < 10) {
+    // 初始化：只执行一次，强制禁用并记录当前物理电平
+    if (!init_done) {
+        random_movement_enabled = false;
+        button_physical_state = (board_button_read() == 0); // 记录当前电平
+        init_done = true;
+        ws2812_restore_status_color(); // 强制设为红色
+        printf("BOOTSEL init: state=%d\n", button_physical_state);
+        return;
+    }
+
+    if (now - last_poll_ms < 20) { // 稍微拉长轮询间隔
         ws2812_status_task();
         return;
     }
     last_poll_ms = now;
 
-    // Pico 的 BOOTSEL 引脚默认上拉，按下为低电平 (0)
-    bool pressed = (board_button_read() == 0);
+    // 直接读取当前物理电平
+    bool current_level = (board_button_read() == 0);
 
-    // 第一次执行（超过 1 秒后）：强制禁用，并记录当前电平
-    if (first_run) {
-        random_movement_enabled = false;      // 强制禁用
-        bootsel_last_level = pressed;
-        first_run = false;
-        ws2812_restore_status_color();        // 恢复为红色（禁用态）
-        printf("BOOTSEL init done, disabled\n");
-        return;
-    }
-
-    // 检测下降沿（从释放到按下）
-    if (pressed && !bootsel_last_level) {
-        if (now - bootsel_last_toggle_ms > 300) {
+    // 检测电平变化（从高到低，即按下）
+    // 注意：这里不依赖 previous 的初始值，只检测真实的电平跳变
+    if (current_level && !button_physical_state) {
+        // 防抖：只有持续稳定的电平变化才触发（由主循环多次读取保证）
+        if (now - button_last_toggle_ms > 300) {
             random_movement_enabled = !random_movement_enabled;
-            bootsel_last_toggle_ms = now;
+            button_last_toggle_ms = now;
             ws2812_flash_state(WS_LOG_ACTIVITY, 150);
             printf("Movement %s\n", random_movement_enabled ? "ENABLED" : "DISABLED");
 
@@ -514,15 +513,15 @@ static void bootsel_task(void) {
             }
         }
     }
-    bootsel_last_level = pressed;
+
+    // 更新上一次的电平状态（无论是否触发切换）
+    button_physical_state = current_level;
     ws2812_status_task();
 }
 
 // ========================================================================
-// TinyUSB 描述符和回调（必须全部实现）
+// TinyUSB 描述符和回调
 // ========================================================================
-
-// 设备描述符
 tusb_desc_device_t const desc_device = {
     .bLength            = sizeof(tusb_desc_device_t),
     .bDescriptorType    = TUSB_DESC_DEVICE,
@@ -544,7 +543,6 @@ const uint8_t* tud_descriptor_device_cb(void) {
     return (const uint8_t*)&desc_device;
 }
 
-// HID 报告描述符（鼠标 + 键盘复合）
 const uint8_t desc_hid_report[] = {
     TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(REPORT_ID_MOUSE)),
     TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(REPORT_ID_KEYBOARD))
@@ -555,7 +553,6 @@ const uint8_t* tud_hid_descriptor_report_cb(uint8_t instance) {
     return desc_hid_report;
 }
 
-// 配置描述符（2 个接口）
 uint8_t const desc_configuration[] = {
     TUD_CONFIG_DESCRIPTOR(1, 2, 0,
                           TUD_CONFIG_DESC_LEN + 2 * TUD_HID_DESC_LEN,
@@ -575,7 +572,6 @@ uint8_t const* tud_descriptor_configuration_cb(uint8_t index) {
     return desc_configuration;
 }
 
-// 字符串描述符
 static const char* string_desc_arr[] = {
     "\x09\x04",
     "Logitech",
@@ -605,7 +601,6 @@ const uint16_t* tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
     return desc_str;
 }
 
-// HID 回调（必须实现，即使空函数）
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
                                hid_report_type_t report_type,
                                uint8_t* buffer, uint16_t reqlen) {
@@ -621,7 +616,6 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
     (void)buffer; (void)bufsiz;
 }
 
-// USB 事件回调
 void tud_mount_cb(void) {
     usb_host_mounted = true;
     usb_suspended = false;
@@ -660,12 +654,12 @@ int main(void) {
 
     srand(to_ms_since_boot(get_absolute_time()));
 
-    tusb_init();
-    if (board_init_after_tusb) board_init_after_tusb();
-
-    // 强制禁用，上电红灯
+    // 强制初始化为禁用
     random_movement_enabled = false;
     ws2812_restore_status_color();
+
+    tusb_init();
+    if (board_init_after_tusb) board_init_after_tusb();
 
     next_keyboard_interval_ms = 0;
     macro_until_ms = 0;
