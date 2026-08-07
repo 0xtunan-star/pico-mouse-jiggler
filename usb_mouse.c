@@ -467,15 +467,19 @@ static void macro_cycle_task(void) {
 }
 
 // ========================================================================
-// BOOTSEL 按键处理（修正极性）
-// ========================================================================
-// ========================================================================
-// BOOTSEL 按键处理（修正上电误触 + 极性修正）
+// BOOTSEL 按键处理（上电 1 秒内忽略 + 强制禁用）
 // ========================================================================
 static void bootsel_task(void) {
     static uint32_t last_poll_ms = 0;
-    static bool first_run = true;           // 首次运行标志，避免上电误触
+    static bool first_run = true;
     uint32_t now = board_millis();
+
+    // 上电前 1 秒内完全忽略按键，避开抖动
+    if (now < 1000) {
+        // 但 LED 状态仍需刷新（保持当前颜色）
+        ws2812_status_task();
+        return;
+    }
 
     if (now - last_poll_ms < 10) {
         ws2812_status_task();
@@ -486,18 +490,19 @@ static void bootsel_task(void) {
     // Pico 的 BOOTSEL 引脚默认上拉，按下为低电平 (0)
     bool pressed = (board_button_read() == 0);
 
-    // 第一次执行只记录电平，不触发任何切换
+    // 第一次执行（超过 1 秒后）：强制禁用，并记录当前电平
     if (first_run) {
+        random_movement_enabled = false;      // 强制禁用
         bootsel_last_level = pressed;
         first_run = false;
-        // 恢复正确的 LED 状态（避免误操作导致的颜色错误）
-        ws2812_restore_status_color();
+        ws2812_restore_status_color();        // 恢复为红色（禁用态）
+        printf("BOOTSEL init done, disabled\n");
         return;
     }
 
     // 检测下降沿（从释放到按下）
     if (pressed && !bootsel_last_level) {
-        if (now - bootsel_last_toggle_ms > 300) {  // 防抖
+        if (now - bootsel_last_toggle_ms > 300) {
             random_movement_enabled = !random_movement_enabled;
             bootsel_last_toggle_ms = now;
             ws2812_flash_state(WS_LOG_ACTIVITY, 150);
