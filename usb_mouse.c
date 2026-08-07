@@ -3,10 +3,11 @@
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * 修改：复合 HID 鼠标 + 键盘，适配 Mac
- * - 鼠标：智能贝塞尔曲线移动 + 随机点击
- * - 键盘：Cmd+S、Cmd+Tab 闪切、Spotlight 误触取消、打字纠错
+ * - 鼠标：贝塞尔曲线移动 + 随机点击 + 微震颤 + 过冲回调
+ * - 键盘：8 种 Mac 实用动作（非阻塞状态机）
+ * - 工作/休息周期：活跃 5~15min，休息 2~5min
  * - LED 状态：琥珀启动，蓝 USB 准备，绿主机就绪，紫活动，黄挂起，红错误
- * - BOOTSEL 短按切换启用/禁用，长按无额外功能（保留）
+ * - BOOTSEL 短按切换启用/禁用
  */
 
 #include <stdio.h>
@@ -67,13 +68,66 @@ static uint32_t ws_activity_duration_ms = 0;
 static bool bootsel_last_level = false;
 static uint32_t bootsel_last_toggle_ms = 0;
 
-// 鼠标任务状态
-static uint32_t last_movement_time = 0;
-static uint32_t next_movement_interval = 0;   // 下次鼠标动作间隔 (ms)
+// ========================================================================
+// 工作/休息周期状态机
+// ========================================================================
+typedef enum {
+    MACRO_STATE_WORK,
+    MACRO_STATE_REST
+} macro_state_t;
 
-// 键盘任务状态
-static uint32_t next_keyboard_interval = 0;   // 下次键盘动作的绝对时间
-static bool keyboard_action_in_progress = false;
+static macro_state_t macro_state = MACRO_STATE_WORK;
+static uint32_t macro_until_ms = 0;          // 下次切换的绝对时间
+
+// ========================================================================
+// 鼠标任务状态
+// ========================================================================
+static uint32_t last_movement_time = 0;
+static uint32_t next_movement_interval = 0;
+
+// 鼠标移动状态机
+typedef enum {
+    MOUSE_STATE_IDLE,
+    MOUSE_STATE_MOVING,
+    MOUSE_STATE_PAUSE,
+    MOUSE_STATE_CLICK
+} mouse_state_t;
+
+static mouse_state_t mouse_state = MOUSE_STATE_IDLE;
+static uint32_t mouse_state_until = 0;
+static int mouse_step = 0, mouse_total_steps = 0;
+static float mouse_total_x = 0, mouse_total_y = 0;
+static float mouse_cur_x = 0, mouse_cur_y = 0;
+static uint32_t mouse_next_tick = 0;
+static bool mouse_overshoot_done = false;
+
+// ========================================================================
+// 键盘任务状态（非阻塞状态机）
+// ========================================================================
+typedef enum {
+    KB_STATE_IDLE,
+    KB_STATE_WAIT_START,          // 等待动作开始前的延迟
+    KB_STATE_SEND_KEY,            // 发送一个按键（按下+释放）
+    KB_STATE_SEND_MOD_KEY,        // 发送带修饰键的按键
+    KB_STATE_WAIT_INTERVAL,       // 按键之间的等待
+    KB_STATE_FINISH               // 动作结束，返回 IDLE
+} keyboard_state_t;
+
+typedef struct {
+    keyboard_state_t state;
+    uint32_t state_until_ms;
+    uint8_t  modifier;
+    uint8_t  keycode;
+    uint8_t  keycode2;            // 用于组合键（如 Cmd+Tab+Shift）
+    uint8_t  step_index;
+    uint8_t  total_steps;
+    uint8_t  step_keys[8][2];     // 每个步骤的 [modifier, keycode]（最多 8 步）
+    uint16_t step_delays[8];      // 每个步骤的延迟（ms）
+    bool     action_running;
+} keyboard_context_t;
+
+static keyboard_context_t kb_ctx = { .state = KB_STATE_IDLE, .action_running = false };
+static uint32_t next_keyboard_interval_ms = 0;
 
 // ========================================================================
 // 辅助函数
@@ -140,10 +194,12 @@ static void ws2812_restore_status_color(void) {
         ws2812_log_state(WS_LOG_USB_READY);
         return;
     }
-    if (random_movement_enabled) {
+    if (random_movement_enabled && macro_state == MACRO_STATE_WORK) {
         set_led_color(dim_color(COLOR_GREEN, 1)); // 亮绿
+    } else if (random_movement_enabled && macro_state == MACRO_STATE_REST) {
+        set_led_color(dim_color(COLOR_AMBER, 1)); // 琥珀色（休息）
     } else {
-        set_led_color(dim_color(COLOR_RED, 1));   // 暗红
+        set_led_color(dim_color(COLOR_RED, 1));   // 暗红（禁用）
     }
 }
 
@@ -190,198 +246,317 @@ static void send_keyboard_report(uint8_t modifier, uint8_t key1, uint8_t key2,
 }
 
 // ========================================================================
-// 鼠标智能移动任务（保留原有完整逻辑，仅微调）
+// 鼠标智能移动任务（带微震颤 + 过冲回调）
 // ========================================================================
 static void hid_task(void) {
     if (!tud_hid_ready()) return;
     if (!random_movement_enabled) return;
+    
+    // 工作/休息周期：休息期完全静止
+    if (macro_state == MACRO_STATE_REST) return;
 
     uint32_t now = board_millis();
-
-    // 动态节奏状态机
-    typedef enum {
-        STATE_IDLE,
-        STATE_MOVING,
-        STATE_PAUSE,
-        STATE_CLICK
-    } state_t;
-    static state_t state = STATE_IDLE;
-    static uint32_t state_until = 0;
-    static int step = 0, total_steps = 0;
-    static float total_x = 0, total_y = 0;
-    static float cur_x = 0, cur_y = 0;
-    static uint32_t next_tick = 0;
-
-    if (now < next_tick) return;
+    if (now < mouse_next_tick) return;
 
     int8_t dx = 0, dy = 0;
 
-    switch (state) {
-        case STATE_IDLE:
-            if (now > state_until) {
-                total_x = rand_range(-200, 200);
-                total_y = rand_range(-200, 200);
-                if (rand() % 5 == 0) { total_x *= 2; total_y *= 2; }
-                float dist = sqrtf(total_x * total_x + total_y * total_y);
-                total_steps = (dist > 150) ? rand_range(20, 40) : rand_range(40, 100);
-                cur_x = 0; cur_y = 0;
-                step = 0;
-                state = STATE_MOVING;
+    switch (mouse_state) {
+        case MOUSE_STATE_IDLE:
+            if (now > mouse_state_until) {
+                mouse_total_x = rand_range(-200, 200);
+                mouse_total_y = rand_range(-200, 200);
+                if (rand() % 5 == 0) { mouse_total_x *= 2; mouse_total_y *= 2; }
+                float dist = sqrtf(mouse_total_x * mouse_total_x + mouse_total_y * mouse_total_y);
+                mouse_total_steps = (dist > 150) ? rand_range(20, 40) : rand_range(40, 100);
+                mouse_cur_x = 0; mouse_cur_y = 0;
+                mouse_step = 0;
+                mouse_overshoot_done = false;
+                mouse_state = MOUSE_STATE_MOVING;
                 ws2812_log_state(WS_LOG_ACTIVITY);
             }
             break;
 
-        case STATE_MOVING: {
-            float t = (float)step / total_steps;
+        case MOUSE_STATE_MOVING: {
+            float t = (float)mouse_step / mouse_total_steps;
             float ease;
             if (t < 0.3) ease = 3 * t * t;
             else if (t < 0.7) ease = 0.5 + (t - 0.3);
             else ease = 1 - (1 - t) * (1 - t);
 
-            float target_x = total_x * ease;
-            float target_y = total_y * ease;
-            dx = (int)(target_x - cur_x);
-            dy = (int)(target_y - cur_y);
-            cur_x = target_x;
-            cur_y = target_y;
+            // ---- 过冲-回调逻辑 ----
+            float target_x = mouse_total_x * ease;
+            float target_y = mouse_total_y * ease;
+            
+            // 在最后 10% 步数，有 30% 概率产生过冲
+            if (!mouse_overshoot_done && t > 0.9 && rand() % 10 < 3) {
+                float overshoot_factor = 1.0f + (rand_range(5, 15) / 100.0f);
+                target_x = mouse_total_x * (ease * overshoot_factor);
+                target_y = mouse_total_y * (ease * overshoot_factor);
+                mouse_overshoot_done = true;
+            }
+            // 过冲后，最后几步回调到目标
+            if (mouse_overshoot_done && t > 0.97) {
+                target_x = mouse_total_x;
+                target_y = mouse_total_y;
+            }
 
-            dx += rand_range(-1, 1);
-            dy += rand_range(-1, 1);
+            dx = (int)(target_x - mouse_cur_x);
+            dy = (int)(target_y - mouse_cur_y);
+            
+            // ---- 微震颤（±1 像素抖动） ----
+            int8_t tremor_x = (rand() % 3) - 1;
+            int8_t tremor_y = (rand() % 3) - 1;
+            dx += tremor_x;
+            dy += tremor_y;
+
+            mouse_cur_x = target_x;
+            mouse_cur_y = target_y;
 
             if (dx != 0 || dy != 0) {
                 send_mouse_report(0, dx, dy);
             }
-            step++;
+            mouse_step++;
 
-            if (step >= total_steps) {
+            if (mouse_step >= mouse_total_steps) {
                 if (rand() % 5 == 0) {
-                    state = STATE_CLICK;
+                    mouse_state = MOUSE_STATE_CLICK;
+                    mouse_next_tick = now + 1;
                 } else {
-                    state = STATE_PAUSE;
-                    state_until = now + rand_range(500, 3000);
+                    mouse_state = MOUSE_STATE_PAUSE;
+                    mouse_state_until = now + rand_range(500, 3000);
+                    mouse_next_tick = now + 10;
                 }
             }
 
             // 动态速度
-            if (t < 0.2)      next_tick = now + rand_range(2, 6);
-            else if (t < 0.8) next_tick = now + rand_range(1, 4);
-            else              next_tick = now + rand_range(5, 15);
+            if (t < 0.2)      mouse_next_tick = now + rand_range(2, 6);
+            else if (t < 0.8) mouse_next_tick = now + rand_range(1, 4);
+            else              mouse_next_tick = now + rand_range(5, 15);
             break;
         }
 
-        case STATE_CLICK:
-            send_mouse_report(0x01, 0, 0); // 左键按下
-            sleep_ms(rand_range(50, 120));
-            send_mouse_report(0x00, 0, 0); // 释放
-            state = STATE_PAUSE;
-            state_until = now + rand_range(800, 4000);
-            next_tick = now + 50;
+        case MOUSE_STATE_CLICK:
+            send_mouse_report(0x01, 0, 0);
+            mouse_next_tick = now + rand_range(50, 120);
+            mouse_state = MOUSE_STATE_PAUSE;
+            mouse_state_until = now + rand_range(800, 4000);
             break;
 
-        case STATE_PAUSE:
-            if (now > state_until) {
-                state = STATE_IDLE;
-                state_until = now + rand_range(2000, 8000);
+        case MOUSE_STATE_PAUSE:
+            if (now > mouse_state_until) {
+                mouse_state = MOUSE_STATE_IDLE;
+                mouse_state_until = now + rand_range(2000, 8000);
                 ws2812_restore_status_color();
             }
-            next_tick = now + rand_range(10, 30);
+            mouse_next_tick = now + rand_range(10, 30);
             break;
     }
 }
 
 // ========================================================================
-// Mac 键盘动作生成
+// 键盘动作构建器（非阻塞状态机）
 // ========================================================================
-static bool generate_mac_keyboard_action(void) {
-    if (!random_movement_enabled) return false;
-    if (keyboard_action_in_progress) return false;
 
-    // 模拟手离开鼠标延迟
-    sleep_ms(rand_range(150, 400));
+// 清空键盘上下文
+static void kb_ctx_reset(void) {
+    kb_ctx.state = KB_STATE_IDLE;
+    kb_ctx.action_running = false;
+    kb_ctx.step_index = 0;
+    kb_ctx.total_steps = 0;
+}
 
-    int action = rand() % 100;
-    uint8_t modifier = 0;
-    uint8_t key = 0;
+// 添加一个按键步骤（无修饰键）
+static void kb_add_step(uint8_t keycode, uint16_t delay_ms) {
+    if (kb_ctx.total_steps >= 8) return;
+    kb_ctx.step_keys[kb_ctx.total_steps][0] = 0;
+    kb_ctx.step_keys[kb_ctx.total_steps][1] = keycode;
+    kb_ctx.step_delays[kb_ctx.total_steps] = delay_ms;
+    kb_ctx.total_steps++;
+}
 
-    if (action < 50) {
-        // ---- Cmd+S (保存) ----
-        modifier = KEYBOARD_MODIFIER_LEFTGUI;   // 0x08
-        key = HID_KEY_S;
-        send_keyboard_report(modifier, key, 0,0,0,0,0);
-        sleep_ms(rand_range(30, 60));
-        send_keyboard_report(0, 0,0,0,0,0,0);
-        printf("Mac: Cmd+S\n");
-    }
-    else if (action < 70) {
-        // ---- Cmd+Tab 闪切 ----
-        modifier = KEYBOARD_MODIFIER_LEFTGUI;
-        key = HID_KEY_TAB;
-        send_keyboard_report(modifier, key, 0,0,0,0,0);
-        sleep_ms(rand_range(60, 120));
-        modifier = KEYBOARD_MODIFIER_LEFTGUI | KEYBOARD_MODIFIER_LEFTSHIFT;
-        send_keyboard_report(modifier, key, 0,0,0,0,0);
-        sleep_ms(rand_range(40, 80));
-        send_keyboard_report(0, 0,0,0,0,0,0);
-        printf("Mac: Cmd+Tab flick\n");
-    }
-    else if (action < 85) {
-        // ---- Spotlight 误触取消 ----
-        modifier = KEYBOARD_MODIFIER_LEFTGUI;
-        key = HID_KEY_SPACE;
-        send_keyboard_report(modifier, key, 0,0,0,0,0);
-        sleep_ms(rand_range(150, 350));
-        send_keyboard_report(0, 0,0,0,0,0,0);
-        sleep_ms(rand_range(100, 200));
-        send_keyboard_report(0, HID_KEY_ESCAPE, 0,0,0,0,0);
-        sleep_ms(rand_range(30, 60));
-        send_keyboard_report(0, 0,0,0,0,0,0);
-        printf("Mac: Spotlight escape\n");
-    }
-    else {
-        // ---- 打字纠错（teh -> the） ----
-        // 输入 't'
-        send_keyboard_report(0, HID_KEY_T, 0,0,0,0,0);
-        sleep_ms(rand_range(60, 120));
-        send_keyboard_report(0, 0,0,0,0,0,0);
-        sleep_ms(rand_range(50, 100));
-        // 'e'
-        send_keyboard_report(0, HID_KEY_E, 0,0,0,0,0);
-        sleep_ms(rand_range(60, 120));
-        send_keyboard_report(0, 0,0,0,0,0,0);
-        sleep_ms(rand_range(50, 100));
-        // 'h'
-        send_keyboard_report(0, HID_KEY_H, 0,0,0,0,0);
-        sleep_ms(rand_range(60, 120));
-        send_keyboard_report(0, 0,0,0,0,0,0);
-        // 退格删除
-        sleep_ms(rand_range(100, 200));
-        send_keyboard_report(0, HID_KEY_BACKSPACE, 0,0,0,0,0);
-        sleep_ms(rand_range(30, 60));
-        send_keyboard_report(0, 0,0,0,0,0,0);
-        // 输入 "the "
-        send_keyboard_report(0, HID_KEY_T, 0,0,0,0,0);
-        sleep_ms(rand_range(60, 120));
-        send_keyboard_report(0, 0,0,0,0,0,0);
-        sleep_ms(rand_range(50, 100));
-        send_keyboard_report(0, HID_KEY_H, 0,0,0,0,0);
-        sleep_ms(rand_range(60, 120));
-        send_keyboard_report(0, 0,0,0,0,0,0);
-        sleep_ms(rand_range(50, 100));
-        send_keyboard_report(0, HID_KEY_E, 0,0,0,0,0);
-        sleep_ms(rand_range(60, 120));
-        send_keyboard_report(0, 0,0,0,0,0,0);
-        sleep_ms(rand_range(50, 100));
-        send_keyboard_report(0, HID_KEY_SPACE, 0,0,0,0,0);
-        sleep_ms(rand_range(30, 60));
-        send_keyboard_report(0, 0,0,0,0,0,0);
-        printf("Mac: Typo fix (teh->the)\n");
-    }
+// 添加一个带修饰键的步骤
+static void kb_add_mod_step(uint8_t modifier, uint8_t keycode, uint16_t delay_ms) {
+    if (kb_ctx.total_steps >= 8) return;
+    kb_ctx.step_keys[kb_ctx.total_steps][0] = modifier;
+    kb_ctx.step_keys[kb_ctx.total_steps][1] = keycode;
+    kb_ctx.step_delays[kb_ctx.total_steps] = delay_ms;
+    kb_ctx.total_steps++;
+}
 
-    // 模拟手放回鼠标
-    sleep_ms(rand_range(200, 500));
-    // 鼠标微抖动联动
-    send_mouse_report(0, rand_range(-2, 2), rand_range(-2, 2));
-    return true;
+// 构建一个键盘动作序列（返回总延迟时间，用于调度）
+static uint32_t kb_build_action(uint8_t action_type) {
+    kb_ctx_reset();
+    
+    // 每个动作开头加一点随机延迟（模拟手从鼠标移开）
+    kb_add_step(0, rand_range(150, 400));
+    
+    switch (action_type) {
+        case 0: { // Cmd+S (保存)
+            kb_add_mod_step(KEYBOARD_MODIFIER_LEFTGUI, HID_KEY_S, rand_range(30, 60));
+            kb_add_step(0, 50);
+            break;
+        }
+        case 1: { // Cmd+Tab 闪切
+            kb_add_mod_step(KEYBOARD_MODIFIER_LEFTGUI, HID_KEY_TAB, rand_range(60, 120));
+            kb_add_mod_step(KEYBOARD_MODIFIER_LEFTGUI | KEYBOARD_MODIFIER_LEFTSHIFT, HID_KEY_TAB, rand_range(40, 80));
+            kb_add_step(0, 50);
+            break;
+        }
+        case 2: { // Spotlight 误触取消
+            kb_add_mod_step(KEYBOARD_MODIFIER_LEFTGUI, HID_KEY_SPACE, rand_range(150, 350));
+            kb_add_step(0, rand_range(100, 200));
+            kb_add_step(HID_KEY_ESCAPE, rand_range(30, 60));
+            kb_add_step(0, 50);
+            break;
+        }
+        case 3: { // 打字纠错 (teh -> the)
+            kb_add_step(HID_KEY_T, rand_range(60, 120));
+            kb_add_step(0, rand_range(50, 100));
+            kb_add_step(HID_KEY_E, rand_range(60, 120));
+            kb_add_step(0, rand_range(50, 100));
+            kb_add_step(HID_KEY_H, rand_range(60, 120));
+            kb_add_step(0, rand_range(100, 200));
+            kb_add_step(HID_KEY_BACKSPACE, rand_range(30, 60));
+            kb_add_step(0, rand_range(50, 100));
+            kb_add_step(HID_KEY_T, rand_range(60, 120));
+            kb_add_step(0, rand_range(50, 100));
+            kb_add_step(HID_KEY_H, rand_range(60, 120));
+            kb_add_step(0, rand_range(50, 100));
+            kb_add_step(HID_KEY_E, rand_range(60, 120));
+            kb_add_step(0, rand_range(50, 100));
+            kb_add_step(HID_KEY_SPACE, rand_range(30, 60));
+            kb_add_step(0, 50);
+            break;
+        }
+        case 4: { // Cmd+W (关闭标签)
+            kb_add_mod_step(KEYBOARD_MODIFIER_LEFTGUI, HID_KEY_W, rand_range(30, 60));
+            kb_add_step(0, 50);
+            break;
+        }
+        case 5: { // 音量加
+            kb_add_step(HID_KEY_VOLUME_UP, rand_range(30, 60));
+            kb_add_step(0, 50);
+            break;
+        }
+        case 6: { // 方向键滚动（下+上）
+            kb_add_step(HID_KEY_ARROW_DOWN, rand_range(80, 200));
+            kb_add_step(0, rand_range(100, 300));
+            kb_add_step(HID_KEY_ARROW_UP, rand_range(80, 200));
+            kb_add_step(0, 50);
+            break;
+        }
+        case 7: { // 输入随机字母然后删除
+            char letters[] = "abcdefghijklmnopqrstuvwxyz";
+            int idx = rand() % 26;
+            uint8_t key = HID_KEY_A + idx;
+            kb_add_step(key, rand_range(80, 150));
+            kb_add_step(0, rand_range(100, 250));
+            kb_add_step(HID_KEY_BACKSPACE, rand_range(30, 60));
+            kb_add_step(0, 50);
+            break;
+        }
+        default: {
+            kb_add_step(0, 50);
+            break;
+        }
+    }
+    
+    // 动作结束后，模拟手放回鼠标（加一个鼠标微抖）
+    // 这个由外层调用者发送
+    return 50; // 额外延迟
+}
+
+// 执行键盘状态机（非阻塞）
+static void keyboard_state_machine(void) {
+    if (kb_ctx.state == KB_STATE_IDLE) return;
+    
+    uint32_t now = board_millis();
+    if (now < kb_ctx.state_until_ms) return;
+    
+    switch (kb_ctx.state) {
+        case KB_STATE_WAIT_START:
+            kb_ctx.state = KB_STATE_SEND_KEY;
+            kb_ctx.step_index = 0;
+            kb_ctx.state_until_ms = now + 1;
+            break;
+            
+        case KB_STATE_SEND_KEY: {
+            if (kb_ctx.step_index >= kb_ctx.total_steps) {
+                // 所有步骤完成
+                kb_ctx.state = KB_STATE_FINISH;
+                kb_ctx.state_until_ms = now + 1;
+                return;
+            }
+            uint8_t mod = kb_ctx.step_keys[kb_ctx.step_index][0];
+            uint8_t key = kb_ctx.step_keys[kb_ctx.step_index][1];
+            uint16_t delay = kb_ctx.step_delays[kb_ctx.step_index];
+            
+            // 发送按键（按下+释放）
+            if (mod != 0 || key != 0) {
+                if (mod != 0 && key != 0) {
+                    // 修饰键 + 普通键
+                    send_keyboard_report(mod, key, 0,0,0,0,0);
+                    kb_ctx.state_until_ms = now + 20;
+                    // 下一状态释放
+                    kb_ctx.state = KB_STATE_SEND_MOD_KEY;
+                } else if (key != 0) {
+                    send_keyboard_report(0, key, 0,0,0,0,0);
+                    kb_ctx.state_until_ms = now + 20;
+                    kb_ctx.state = KB_STATE_SEND_KEY; // 同状态，但下一轮会释放并进入等待
+                    // 标记为释放阶段
+                    kb_ctx.step_keys[kb_ctx.step_index][1] = 0; // 下一次发空
+                }
+            } else {
+                // key=0 表示纯延迟或释放
+                if (kb_ctx.step_index == 0 && delay > 50) {
+                    // 初始延迟，只等不发送
+                    kb_ctx.state_until_ms = now + delay;
+                    kb_ctx.state = KB_STATE_WAIT_INTERVAL;
+                } else {
+                    // 释放所有按键
+                    send_keyboard_report(0, 0,0,0,0,0,0);
+                    kb_ctx.step_index++;
+                    kb_ctx.state_until_ms = now + delay;
+                    kb_ctx.state = KB_STATE_WAIT_INTERVAL;
+                }
+            }
+            break;
+        }
+        
+        case KB_STATE_SEND_MOD_KEY: {
+            // 释放带修饰键的按键
+            uint8_t mod = kb_ctx.step_keys[kb_ctx.step_index][0];
+            if (mod != 0) {
+                send_keyboard_report(mod, 0,0,0,0,0,0); // 先释放普通键，保留修饰
+                kb_ctx.state_until_ms = now + 20;
+                kb_ctx.state = KB_STATE_SEND_KEY;
+                // 准备进入下一个步骤的释放阶段
+                kb_ctx.step_keys[kb_ctx.step_index][0] = 0;
+                kb_ctx.step_keys[kb_ctx.step_index][1] = 0;
+            }
+            break;
+        }
+        
+        case KB_STATE_WAIT_INTERVAL: {
+            // 等待完成，进入下一步
+            kb_ctx.step_index++;
+            kb_ctx.state = KB_STATE_SEND_KEY;
+            kb_ctx.state_until_ms = now + 1;
+            break;
+        }
+        
+        case KB_STATE_FINISH:
+            // 动作完成，发送鼠标微抖联动
+            send_mouse_report(0, rand_range(-2, 2), rand_range(-2, 2));
+            kb_ctx_reset();
+            // 更新下次键盘动作时间
+            next_keyboard_interval_ms = board_millis() + rand_range(90000, 270000);
+            break;
+            
+        default:
+            kb_ctx_reset();
+            break;
+    }
 }
 
 // ========================================================================
@@ -389,23 +564,73 @@ static bool generate_mac_keyboard_action(void) {
 // ========================================================================
 static void keyboard_task(void) {
     if (!random_movement_enabled) {
-        next_keyboard_interval = 0;
+        next_keyboard_interval_ms = 0;
         return;
     }
-
+    
+    // 工作/休息周期：休息期不执行键盘动作
+    if (macro_state == MACRO_STATE_REST) return;
+    
+    // 如果有键盘动作正在执行，驱动状态机
+    if (kb_ctx.action_running) {
+        keyboard_state_machine();
+        return;
+    }
+    
+    // 调度下一次键盘动作
     uint32_t now = board_millis();
-    if (next_keyboard_interval == 0) {
+    if (next_keyboard_interval_ms == 0) {
         // 首次：2~5分钟后触发
-        next_keyboard_interval = now + rand_range(120000, 300000);
+        next_keyboard_interval_ms = now + rand_range(120000, 300000);
         return;
     }
+    
+    if (now >= next_keyboard_interval_ms) {
+        // 随机选择 8 种动作之一
+        uint8_t action = rand() % 8;
+        kb_build_action(action);
+        kb_ctx.action_running = true;
+        kb_ctx.state = KB_STATE_WAIT_START;
+        kb_ctx.state_until_ms = now + 1;
+    }
+}
 
-    if (now >= next_keyboard_interval) {
-        keyboard_action_in_progress = true;
-        generate_mac_keyboard_action();
-        keyboard_action_in_progress = false;
-        // 下次间隔 1.5~4.5 分钟
-        next_keyboard_interval = now + rand_range(90000, 270000);
+// ========================================================================
+// 工作/休息周期状态机
+// ========================================================================
+static void macro_cycle_task(void) {
+    if (!random_movement_enabled) {
+        // 禁用时，强制进入工作态（但灯色由禁用逻辑控制）
+        macro_state = MACRO_STATE_WORK;
+        return;
+    }
+    
+    uint32_t now = board_millis();
+    
+    if (macro_until_ms == 0) {
+        // 首次启动：直接进入工作态，持续 5~15 分钟
+        macro_state = MACRO_STATE_WORK;
+        macro_until_ms = now + rand_range(300000, 900000); // 5~15 分钟
+        return;
+    }
+    
+    if (now >= macro_until_ms) {
+        if (macro_state == MACRO_STATE_WORK) {
+            // 工作结束，进入休息（2~5 分钟）
+            macro_state = MACRO_STATE_REST;
+            macro_until_ms = now + rand_range(120000, 300000);
+            ws2812_restore_status_color();
+            // 强制暂停鼠标移动（重置鼠标状态机）
+            mouse_state = MOUSE_STATE_IDLE;
+            mouse_state_until = now + rand_range(2000, 8000);
+            printf("Entering REST period\n");
+        } else {
+            // 休息结束，回到工作
+            macro_state = MACRO_STATE_WORK;
+            macro_until_ms = now + rand_range(300000, 900000);
+            ws2812_restore_status_color();
+            printf("Entering WORK period\n");
+        }
     }
 }
 
@@ -429,6 +654,12 @@ static void bootsel_task(void) {
             bootsel_last_toggle_ms = now;
             ws2812_flash_state(WS_LOG_ACTIVITY, 150);
             printf("Movement %s\n", random_movement_enabled ? "ENABLED" : "DISABLED");
+            
+            if (random_movement_enabled) {
+                // 启用时，重置工作周期
+                macro_until_ms = 0;
+                macro_state = MACRO_STATE_WORK;
+            }
         }
     }
     bootsel_last_level = pressed;
@@ -446,8 +677,8 @@ tusb_desc_device_t const desc_device = {
     .bDeviceSubClass    = 0x00,
     .bDeviceProtocol    = 0x00,
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
-    .idVendor           = 0x046d, // Logitech
-    .idProduct          = 0xc539, // G304
+    .idVendor           = 0x046d,
+    .idProduct          = 0xc539,
     .bcdDevice          = 0x0100,
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
@@ -459,11 +690,9 @@ const uint8_t* tud_descriptor_device_cb(void) {
     return (uint8_t const*)&desc_device;
 }
 
-// 合并的 HID 报告描述符：鼠标 ID=1，键盘 ID=2
+// HID 报告描述符（鼠标 + 键盘复合）
 const uint8_t desc_hid_report[] = {
-    // 鼠标报告 (ID=1)
     TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(REPORT_ID_MOUSE)),
-    // 键盘报告 (ID=2)
     TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(REPORT_ID_KEYBOARD))
 };
 
@@ -478,12 +707,10 @@ uint8_t const desc_configuration[] = {
                           TUD_CONFIG_DESC_LEN + 2 * TUD_HID_DESC_LEN,
                           TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
 
-    // 鼠标接口 (Interface 0)
     TUD_HID_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_MOUSE,
                        sizeof(desc_hid_report), 0x81,
                        CFG_TUD_HID_EP_BUFSIZE, 10),
 
-    // 键盘接口 (Interface 1)
     TUD_HID_DESCRIPTOR(1, 0, HID_ITF_PROTOCOL_KEYBOARD,
                        sizeof(desc_hid_report), 0x82,
                        CFG_TUD_HID_EP_BUFSIZE, 10),
@@ -496,10 +723,10 @@ uint8_t const* tud_descriptor_configuration_cb(uint8_t index) {
 
 // 字符串描述符
 static const char* string_desc_arr[] = {
-    "\x09\x04",              // 0: 语言 ID (0x0409)
-    "Logitech",              // 1: 厂商
-    "Logitech G304 + KB",    // 2: 产品
-    "C539-001",              // 3: 序列号
+    "\x09\x04",
+    "Logitech",
+    "Logitech G304 + KB",
+    "C539-001",
 };
 
 const uint16_t* tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
@@ -524,7 +751,7 @@ const uint16_t* tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
     return desc_str;
 }
 
-// HID 回调（必须实现，但无需额外操作）
+// HID 回调
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
                                hid_report_type_t report_type,
                                uint8_t* buffer, uint16_t reqlen) {
@@ -541,7 +768,7 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
 }
 
 // ========================================================================
-// USB 事件回调（更新 LED 状态）
+// USB 事件回调
 // ========================================================================
 void tud_mount_cb(void) {
     usb_host_mounted = true;
@@ -588,13 +815,16 @@ int main(void) {
     if (board_init_after_tusb) board_init_after_tusb();
     ws2812_restore_status_color();
 
-    // 初始化键盘定时器
-    next_keyboard_interval = 0;
+    // 初始化调度器
+    next_keyboard_interval_ms = 0;
+    macro_until_ms = 0;
+    kb_ctx_reset();
 
     while (true) {
         tud_task();
-        hid_task();
-        keyboard_task();
+        macro_cycle_task();      // 工作/休息周期（最高层）
+        hid_task();              // 鼠标移动（受 macro_state 影响）
+        keyboard_task();         // 键盘动作（受 macro_state 影响）
         bootsel_task();
     }
 }
