@@ -469,8 +469,12 @@ static void macro_cycle_task(void) {
 // ========================================================================
 // BOOTSEL 按键处理（修正极性）
 // ========================================================================
+// ========================================================================
+// BOOTSEL 按键处理（修正上电误触 + 极性修正）
+// ========================================================================
 static void bootsel_task(void) {
     static uint32_t last_poll_ms = 0;
+    static bool first_run = true;           // 首次运行标志，避免上电误触
     uint32_t now = board_millis();
 
     if (now - last_poll_ms < 10) {
@@ -479,9 +483,21 @@ static void bootsel_task(void) {
     }
     last_poll_ms = now;
 
-    bool pressed = (board_button_read() == 0);  // 按下为低电平
+    // Pico 的 BOOTSEL 引脚默认上拉，按下为低电平 (0)
+    bool pressed = (board_button_read() == 0);
+
+    // 第一次执行只记录电平，不触发任何切换
+    if (first_run) {
+        bootsel_last_level = pressed;
+        first_run = false;
+        // 恢复正确的 LED 状态（避免误操作导致的颜色错误）
+        ws2812_restore_status_color();
+        return;
+    }
+
+    // 检测下降沿（从释放到按下）
     if (pressed && !bootsel_last_level) {
-        if (now - bootsel_last_toggle_ms > 300) {
+        if (now - bootsel_last_toggle_ms > 300) {  // 防抖
             random_movement_enabled = !random_movement_enabled;
             bootsel_last_toggle_ms = now;
             ws2812_flash_state(WS_LOG_ACTIVITY, 150);
