@@ -2,12 +2,12 @@
  * Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * 最终优化版：复合 HID 鼠标 + 键盘，适配 Mac / Windows
+ * 最终修复版：复合 HID 鼠标 + 键盘，适配 Mac / Windows
  * - 鼠标：贝塞尔曲线 + 微震颤 + 过冲回调 + 随机点击（已修复释放）
  * - 键盘：8 种 Mac 实用动作（非阻塞状态机）
  * - 工作/休息周期：活跃 5~15min，休息 2~5min
  * - LED 状态：琥珀启动，蓝 USB 准备，绿工作，琥珀休息，紫活动，黄挂起，红错误
- * - BOOTSEL 短按切换启用/禁用
+ * - BOOTSEL 短按切换启用/禁用（修正按键极性）
  */
 
 #include <stdio.h>
@@ -85,7 +85,7 @@ typedef enum {
     MOUSE_STATE_MOVING,
     MOUSE_STATE_PAUSE,
     MOUSE_STATE_CLICK,
-    MOUSE_STATE_CLICK_RELEASE   // 新增：释放点击
+    MOUSE_STATE_CLICK_RELEASE
 } mouse_state_t;
 
 static mouse_state_t mouse_state = MOUSE_STATE_IDLE;
@@ -241,7 +241,7 @@ static void send_keyboard_report(uint8_t modifier, uint8_t key1, uint8_t key2,
 }
 
 // ========================================================================
-// 鼠标智能移动任务（含微震颤 + 过冲回调 + 修复点击释放）
+// 鼠标智能移动任务（含微震颤 + 过冲回调 + 点击释放修复）
 // ========================================================================
 static void hid_task(void) {
     if (!tud_hid_ready()) return;
@@ -325,13 +325,13 @@ static void hid_task(void) {
         }
 
         case MOUSE_STATE_CLICK:
-            send_mouse_report(0x01, 0, 0);   // 左键按下
+            send_mouse_report(0x01, 0, 0);
             mouse_state = MOUSE_STATE_CLICK_RELEASE;
             mouse_next_tick = now + rand_range(50, 120);
             break;
 
         case MOUSE_STATE_CLICK_RELEASE:
-            send_mouse_report(0x00, 0, 0);   // 左键释放
+            send_mouse_report(0x00, 0, 0);
             mouse_state = MOUSE_STATE_PAUSE;
             mouse_state_until = now + rand_range(800, 4000);
             mouse_next_tick = now + 10;
@@ -594,7 +594,7 @@ static void macro_cycle_task(void) {
 }
 
 // ========================================================================
-// BOOTSEL 按键处理
+// BOOTSEL 按键处理（修正极性：按下为低电平）
 // ========================================================================
 static void bootsel_task(void) {
     static uint32_t last_poll_ms = 0;
@@ -606,7 +606,8 @@ static void bootsel_task(void) {
     }
     last_poll_ms = now;
 
-    bool pressed = board_button_read() != 0;
+    // Pico 的 BOOTSEL 引脚默认上拉，按下为低电平 (0)
+    bool pressed = (board_button_read() == 0);
     if (pressed && !bootsel_last_level) {
         if (now - bootsel_last_toggle_ms > 300) {
             random_movement_enabled = !random_movement_enabled;
