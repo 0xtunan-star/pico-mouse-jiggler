@@ -11,12 +11,16 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          # 只安装 cmake 和 ninja（很小）
           sudo apt-get install -y cmake ninja-build
-          # 下载 ARM 官方工具链（约 150MB，比 apt 的 600MB 小很多）
+          # 下载 ARM 官方工具链（约 150 MB）
           wget -q https://developer.arm.com/-/media/Files/downloads/gnu/13.2.rel1/binrel/arm-gnu-toolchain-13.2.rel1-x86_64-arm-none-eabi.tar.xz
           tar -xf arm-gnu-toolchain-*.tar.xz
-          echo "$(pwd)/arm-gnu-toolchain/bin" >> $GITHUB_PATH
+          # 找到解压后的实际目录（可能是 arm-gnu-toolchain-13.2.rel1）
+          TOOLCHAIN_DIR=$(find . -maxdepth 1 -type d -name "arm-gnu-toolchain*" | head -1)
+          # 将 bin 目录加入 PATH
+          echo "$(pwd)/$TOOLCHAIN_DIR/bin" >> $GITHUB_PATH
+          # 设置 PICO_TOOLCHAIN_PATH 以供 CMake 使用
+          echo "PICO_TOOLCHAIN_PATH=$(pwd)/$TOOLCHAIN_DIR" >> $GITHUB_ENV
 
       - name: Clone Pico SDK
         run: |
